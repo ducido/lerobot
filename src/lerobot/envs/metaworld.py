@@ -69,7 +69,7 @@ TASK_POLICY_MAPPING: dict[str, Any] = {
 }
 ACTION_DIM = 4
 OBS_DIM = 4
-
+import mujoco
 
 class MetaworldEnv(gym.Env):
     metadata = {"render_modes": ["rgb_array"], "render_fps": 80}
@@ -84,11 +84,13 @@ class MetaworldEnv(gym.Env):
         observation_height=480,
         visualization_width=640,
         visualization_height=480,
+        render_segmentation=False
     ):
         super().__init__()
         self.task = task.replace("metaworld-", "")
         self.obs_type = obs_type
         self.render_mode = render_mode
+        self.render_segmentation = render_segmentation
         self.observation_width = observation_width
         self.observation_height = observation_height
         self.visualization_width = visualization_width
@@ -104,17 +106,27 @@ class MetaworldEnv(gym.Env):
         if self.obs_type == "state":
             raise NotImplementedError()
         elif self.obs_type == "pixels":
-            self.observation_space = spaces.Dict(
-                {
-                    "pixels": spaces.Box(
-                        low=0,
-                        high=255,
-                        shape=(self.observation_height, self.observation_width, 3),
-                        dtype=np.uint8,
-                    )
-                }
-            )
+            spaces_dict = {
+                "pixels": spaces.Box(
+                    low=0,
+                    high=255,
+                    shape=(self.observation_height, self.observation_width, 3),
+                    dtype=np.uint8,
+                )
+            }
+            if self.render_segmentation:
+                spaces_dict["segmentation"] = spaces.Box(
+                    low=0,
+                    high=10000,
+                    shape=(self.observation_height, self.observation_width),
+                    dtype=np.int32,
+                )
+            self.observation_space = spaces.Dict(spaces_dict)
+
         elif self.obs_type == "pixels_agent_pos":
+            # Lấy state dim từ env
+            dummy_obs, _ = self._env.reset()
+            state_dim = dummy_obs.shape[0]
             self.observation_space = spaces.Dict(
                 {
                     "pixels": spaces.Box(
@@ -129,8 +141,21 @@ class MetaworldEnv(gym.Env):
                         shape=(OBS_DIM,),
                         dtype=np.float64,
                     ),
+                    "segmentation": spaces.Box(
+                        low=0,
+                        high=10000,
+                        shape=(self.observation_height, self.observation_width),
+                        dtype=np.int32,
+                    ),
+                    "environment_state": spaces.Box(
+                        low=-np.inf,
+                        high=np.inf,
+                        shape=(state_dim,),
+                        dtype=np.float32,
+                    ),
                 }
-            )
+                    )
+ 
 
         self.action_space = spaces.Box(low=-1, high=1, shape=(ACTION_DIM,), dtype=np.float32)
 
@@ -147,9 +172,81 @@ class MetaworldEnv(gym.Env):
             image = np.flip(image, (0, 1))
         return image
 
+    def _render_segmentation(self) -> np.ndarray:
+        """
+        Render segmentation mask using MuJoCo low-level API.
+
+        Returns:
+            seg: (H, W) int32 mask where each value is geom_id
+        """
+        renderer = self._env.mujoco_renderer
+        viewer = renderer._get_viewer(render_mode="rgb_array")
+
+        seg = viewer.render(
+            render_mode="rgb_array",
+            segmentation=True,
+            camera_id=renderer.camera_id,
+        )
+
+        # seg shape: (H, W, 2)
+        # seg[..., 0] = object type
+        # seg[..., 1] = object id (geom id)
+
+        geom_mask = seg[..., 1].astype(np.int32)
+
+        if self.camera_name == "corner2":
+            geom_mask = np.flip(geom_mask, (0, 1))
+
+        return geom_mask
+
+    def _build_geom_id_to_name(self) -> dict[int, str]:
+        model = self._env.model
+        mapping = {0: "background"}
+
+        for geom_id in range(1, model.ngeom):
+            name = mujoco.mj_id2name(
+                model,
+                mujoco.mjtObj.mjOBJ_GEOM,
+                geom_id,
+            )
+            if name is None:
+                name = f"unnamed_geom_{geom_id}"
+            mapping[geom_id] = name
+
+        return mapping
+
+    def _build_geom_id_to_body_name(self) -> dict[int, str]:
+        model = self._env.model
+        mapping = {0: "background"}
+
+        for geom_id in range(1, model.ngeom):
+            body_id = model.geom_bodyid[geom_id]
+
+            body_name = mujoco.mj_id2name(
+                model,
+                mujoco.mjtObj.mjOBJ_BODY,
+                body_id,
+            )
+
+            if body_name is None:
+                body_name = f"unnamed_body_{body_id}"
+
+            mapping[geom_id] = body_name
+
+        return mapping
+
+            
+    def _get_segmentation_metadata(self) -> dict[str, Any]:
+        if not hasattr(self, "_segmentation_metadata"):
+            self._segmentation_metadata = {
+                "geom_id_to_geom_name": self._build_geom_id_to_name(),
+                "geom_id_to_body_name": self._build_geom_id_to_body_name(),
+            }
+        return self._segmentation_metadata
+        
     def _make_envs_task(self, env_name: str):
         mt1 = metaworld.MT1(env_name, seed=42)
-        env = mt1.train_classes[env_name](render_mode="rgb_array", camera_name=self.camera_name)
+        env = mt1.train_classes[env_name](render_mode=self.render_mode, camera_name=self.camera_name)
         env.set_task(mt1.train_tasks[0])
         if self.camera_name == "corner2":
             env.model.cam_pos[2] = [
@@ -163,17 +260,19 @@ class MetaworldEnv(gym.Env):
 
     def _format_raw_obs(self, raw_obs: np.ndarray) -> dict[str, Any]:
         image = None
+        segmentation = None
         if self._env is not None:
             image = self._env.render()
             if self.camera_name == "corner2":
                 # NOTE: The "corner2" camera in MetaWorld environments outputs images with both axes inverted.
                 image = np.flip(image, (0, 1))
+            if self.render_segmentation:
+                segmentation = self._render_segmentation()
         agent_pos = raw_obs[:4]
         if self.obs_type == "state":
             raise NotImplementedError(
                 "'state' obs_type not implemented for MetaWorld. Use pixel modes instead."
             )
-
         elif self.obs_type in ("pixels", "pixels_agent_pos"):
             assert image is not None, (
                 "Expected `image` to be rendered before constructing pixel-based observations. "
@@ -182,12 +281,17 @@ class MetaworldEnv(gym.Env):
 
             if self.obs_type == "pixels":
                 obs = {"pixels": image.copy()}
-
+                if self.render_segmentation:
+                    obs["segmentation"] = segmentation.copy()
             else:  # pixels_agent_pos
                 obs = {
                     "pixels": image.copy(),
                     "agent_pos": agent_pos,
+                    "environment_state": raw_obs.copy(),
                 }
+                if self.render_segmentation:
+                    obs["segmentation"] = segmentation.copy()
+
         else:
             raise ValueError(f"Unknown obs_type: {self.obs_type}")
         return obs
@@ -214,6 +318,7 @@ class MetaworldEnv(gym.Env):
         observation = self._format_raw_obs(raw_obs)
 
         info = {"is_success": False}
+        info['ooi_mapping'] = self._build_geom_id_to_body_name()
         return observation, info
 
     def step(self, action: np.ndarray) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:
@@ -245,6 +350,8 @@ class MetaworldEnv(gym.Env):
                 "task": self.task,
                 "done": done,
                 "is_success": is_success,
+                'ooi_mapping': self._build_geom_id_to_body_name()
+
             }
         )
 
@@ -255,6 +362,7 @@ class MetaworldEnv(gym.Env):
                 "task": self.task,
                 "done": bool(done),
                 "is_success": bool(is_success),
+                'ooi_mapping': self._build_geom_id_to_body_name()
             }
             self.reset()
 
