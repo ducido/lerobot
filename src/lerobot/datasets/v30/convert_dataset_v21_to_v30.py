@@ -38,6 +38,11 @@ python src/lerobot/datasets/v30/convert_dataset_v21_to_v30.py \
     --repo-id=lerobot/pusht \
     --root=/path/to/local/dataset/directory
     --push-to-hub=false
+
+python src/lerobot/datasets/v30/convert_dataset_v21_to_v30.py \
+    --repo-id=None \
+    --root=/pfss/mlde/workspaces/mlde_wsp_IAS_SAMMerge/VLA/LIBERO/merged_libero_scale_100_mask_depth_noops_lerobot_v30 \
+    --push-to-hub=false
 ```
 
 """
@@ -469,7 +474,7 @@ def convert_dataset(
 
     # Set root based on whether local dataset path is provided
     use_local_dataset = False
-    root = HF_LEROBOT_HOME / repo_id if root is None else Path(root) / repo_id
+    root = HF_LEROBOT_HOME / repo_id if root is None else Path(root)
     if root.exists():
         validate_local_dataset_version(root)
         use_local_dataset = True
