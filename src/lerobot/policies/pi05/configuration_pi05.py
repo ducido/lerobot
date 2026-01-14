@@ -157,7 +157,7 @@ class PI05Config(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> None:
-        return None
+        return [0,10]
 
     @property
     def action_delta_indices(self) -> list:

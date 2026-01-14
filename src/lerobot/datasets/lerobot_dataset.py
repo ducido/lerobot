@@ -745,6 +745,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if self.delta_timestamps is not None:
             check_delta_timestamps(self.delta_timestamps, self.fps, self.tolerance_s)
             self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
+        self.delta_indices['observation.images.object_of_interest_mask'] = self.delta_indices['observation.images.image']
+        self.delta_indices['observation.images.object_of_interest_wrist_mask'] = self.delta_indices['observation.images.image']
+        print(self.delta_indices)
 
     def _close_writer(self) -> None:
         """Close and cleanup the parquet writer if it exists."""
@@ -1060,6 +1063,16 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # Add task as a string
         task_idx = item["task_index"].item()
         item["task"] = self.meta.tasks.iloc[task_idx].name
+
+        item["observation.goal_static_list"] = item['observation.images.image'][1:]
+        item["observation.goal_wrist_list"] = item['observation.images.wrist_image'][1:]
+        item['observation.images.image'] = item['observation.images.image'][0]
+        item['observation.images.wrist_image'] = item['observation.images.wrist_image'][0]
+        item['observation.state'] = item['observation.state'][0]
+
+        # print(item['observation.images.object_of_interest_mask'].shape)
+        item['observation.goal_mask_static_list'] = item['observation.images.object_of_interest_mask'][1:]
+        item['observation.goal_mask_wrist_list'] = item['observation.images.object_of_interest_wrist_mask'][1:]
         return item
 
     def __repr__(self):

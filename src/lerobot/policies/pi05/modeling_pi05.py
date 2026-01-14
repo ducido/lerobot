@@ -426,6 +426,20 @@ class PaliGemmaWithExpertModel(
         if self.train_expert_only:
             self.paligemma.eval()
 
+    def get_siglip_image_features(self, pixel_values, raw_pool=False):
+        """
+        Obtains image last hidden states from the vision tower and apply multimodal projection.
+
+        Args:
+            pixel_values (`torch.FloatTensor]` of shape `(batch_size, channels, height, width)`)
+               The tensors corresponding to the input images.
+        Returns:
+            image_features (`torch.Tensor`): Image feature tensor of shape `(num_images, image_length, embed_dim)`).
+        """
+        image_outputs = self.paligemma.vision_tower(pixel_values)
+        selected_image_feature = image_outputs.last_hidden_state
+        return selected_image_feature
+
     def embed_image(self, image: torch.Tensor):
         return self.paligemma.model.get_image_features(image)
 
@@ -504,6 +518,8 @@ class PaliGemmaWithExpertModel(
                         gemma_expert=self.gemma_expert,
                     )
 
+            outputs_embeds_after_resi = inputs_embeds
+
             # final norm
             def compute_final_norms(inputs_embeds, adarms_cond):
                 outputs_embeds = []
@@ -528,7 +544,7 @@ class PaliGemmaWithExpertModel(
             suffix_output = outputs_embeds[1]
             prefix_past_key_values = None
 
-        return [prefix_output, suffix_output], prefix_past_key_values
+        return [prefix_output, suffix_output], prefix_past_key_values, outputs_embeds_after_resi
 
 
 class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
@@ -562,6 +578,15 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+
+        self.infonce_loss = ClipInfoNCE()
+        self.num_goals = 1
+        self.mapping_pali_to_siglip_list = nn.ModuleList(
+            [nn.Linear(2048, 1152) for _ in range(self.num_goals)]
+        )
+        # self.mapping_siglip_to_pali_list = nn.ModuleList(
+        #     [nn.Linear(1152, 2048) for _ in range(self.num_goals)]
+        # ).to(torch.bfloat16)
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -638,6 +663,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         embs = []
         pad_masks = []
         att_masks = []
+        pooling_vision_embs = []
 
         # Process images
         for img, img_mask in zip(images, img_masks, strict=True):
@@ -649,6 +675,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             bsize, num_img_embs = img_emb.shape[:2]
 
             embs.append(img_emb)
+            pooling_vision_embs.append(img_emb.mean(dim=1, keepdim=True))
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
             att_masks += [0] * num_img_embs
 
@@ -664,6 +691,14 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
+
+        ############## Rep Token here
+        rep_tokens = torch.cat(pooling_vision_embs, dim=1).clone() # bs, 2, 2048
+        for i in range(self.num_goals):
+            embs.append(rep_tokens.clone())
+            pad_masks.append(torch.ones(bsize, 2, dtype=torch.bool, device=lang_emb.device))
+        att_masks += [1] + [0]*(self.num_goals*2 - 1)
+        ##############
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -721,7 +756,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, images, img_masks, tokens, masks, actions, noise=None, time=None) -> Tensor:
+    def forward(self, images, img_masks, tokens, masks, actions, list_multi_goal_static_feat, list_multi_goal_wrist_feat, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss."""
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -752,7 +787,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+            (_, suffix_out), _, outputs_embeds_after_resi  = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
                 past_key_values=None,
@@ -760,9 +795,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
             )
-            return suffix_out
+            return suffix_out, outputs_embeds_after_resi 
 
-        suffix_out = self._apply_checkpoint(
+        suffix_out, outputs_embeds_after_resi  = self._apply_checkpoint(
             forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
 
@@ -771,10 +806,51 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         def action_out_proj_func(suffix_out):
             return self.action_out_proj(suffix_out)
-
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        action_loss = F.mse_loss(u_t, v_t, reduction="none")
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        img_imi_loss, wrist_imi_loss, img_imi_dict, wrist_imi_dict = self.imi_loss(outputs_embeds_after_resi, list_multi_goal_static_feat, list_multi_goal_wrist_feat)
+
+        return action_loss, img_imi_loss, wrist_imi_loss, img_imi_dict, wrist_imi_dict
+
+    def imi_loss(self, outputs_embeds_after_resi, list_multi_goal_static_feat, list_multi_goal_wrist_feat):
+        prefix_emb_after_resi, _ = outputs_embeds_after_resi
+        current_rep_tokens_after_resi = prefix_emb_after_resi[:,(-2*self.num_goals):,:] # dim = 2048
+        current_rep_tokens_after_resi = F.normalize(current_rep_tokens_after_resi, dim=-1).to(dtype=torch.float32)
+
+
+        current_rep_static_emb_after_resi = current_rep_tokens_after_resi[:,0::2]
+        current_rep_wrist_emb_after_resi = current_rep_tokens_after_resi[:,1::2]
+
+        img_imi_loss, wrist_imi_loss = 0, 0
+        img_imi_dict = {
+            "temperature": 0,
+            "pos_mean": 0,
+            "neg_mean": 0
+        }
+        wrist_imi_dict = {
+            "temperature": 0,
+            "pos_mean": 0,
+            "neg_mean": 0
+        }
+        
+        # list_multi_goal_static_feat = list_multi_goal_static_feat[:,2,:].unsqueeze(dim=1)
+        # print(list_multi_goal_static_feat.shape)
+        assert self.num_goals == list_multi_goal_static_feat.shape[1] == list_multi_goal_wrist_feat.shape[1] == current_rep_static_emb_after_resi.shape[1] == current_rep_wrist_emb_after_resi.shape[1]
+        for i in range(self.num_goals):
+            current_rep_token_static_embs = self.mapping_pali_to_siglip_list[i](current_rep_static_emb_after_resi[:,i])
+            current_rep_token_wrist_embs = self.mapping_pali_to_siglip_list[i](current_rep_wrist_emb_after_resi[:,i])
+            a, a_dict = self.infonce_loss(current_rep_token_static_embs, list_multi_goal_static_feat[:,i,:].detach().to(dtype=torch.float32))
+            b, b_dict = self.infonce_loss(current_rep_token_wrist_embs, list_multi_goal_wrist_feat[:,i,:].detach().to(dtype=torch.float32))
+
+            img_imi_loss += a / self.num_goals
+            wrist_imi_loss += b / self.num_goals
+
+            for key in img_imi_dict.keys():
+                img_imi_dict[key] += a_dict[key] / self.num_goals
+                wrist_imi_dict[key] += b_dict[key] / self.num_goals
+
+        return img_imi_loss, wrist_imi_loss, img_imi_dict, wrist_imi_dict
 
     @torch.no_grad()  # see openpi `sample_actions` (slightly adapted)
     def sample_actions(
@@ -1140,7 +1216,8 @@ class PI05Policy(PreTrainedPolicy):
         # Get device from model parameters
         device = next(self.parameters()).device
 
-        present_img_keys = [key for key in self.config.image_features if key in batch]
+        # present_img_keys = [key for key in self.config.image_features if key in batch]
+        present_img_keys = ['observation.images.image', 'observation.images.wrist_image']
         missing_img_keys = [key for key in self.config.image_features if key not in batch]
 
         if len(present_img_keys) == 0:
@@ -1234,6 +1311,63 @@ class PI05Policy(PreTrainedPolicy):
 
         return actions
 
+
+    def embedding_multi_goal_images(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
+        """Preprocess images for the model.
+
+        Images from LeRobot are typically in [B, C, H, W] format and normalized to [0, 1].
+        PaliGemma expects images in [B, C, H, W] format and normalized to [-1, 1].
+        """
+
+
+        # Get device from model parameters
+        device = next(self.parameters()).device
+
+        present_img_keys = ['observation.goal_static_list', 'observation.goal_wrist_list']
+        all_embs = []
+
+        # Preprocess image features present in the batch
+
+        for key in present_img_keys:
+            batched_list_of_img  = batch[key]
+
+            # Ensure tensor is on the same device as the model
+            if batched_list_of_img .device != device:
+                batched_list_of_img  = batched_list_of_img .to(device)
+            # Ensure float32 dtype for consistency
+            if batched_list_of_img .dtype != torch.float32:
+                batched_list_of_img  = batched_list_of_img .to(torch.float32)
+
+            
+            embs = []
+            for i in range(batched_list_of_img.shape[1]):
+                img = batched_list_of_img[:,i,:,:,:] # bs, 3, 256, 256
+
+                ######################
+                if key == 'observation.goal_static_list':
+                    mask = batch['observation.goal_mask_static_list'][:,i,:,:,:]
+                if key == 'observation.goal_wrist_list':
+                    mask = batch['observation.goal_mask_wrist_list'][:,i,:,:,:]
+
+                crop_images = [crop_image_by_mask(img[i], mask[i]).unsqueeze(dim=0) for i in range(len(mask))]
+                img = torch.cat(crop_images, dim=0)
+                ######################
+
+                # from openpi preprocess_observation_pytorch: Resize with padding if needed
+                if img.shape[1:3] != self.config.image_resolution:
+                    img = resize_with_pad_torch(img, *self.config.image_resolution)
+
+                # Normalize from [0,1] to [-1,1] as expected by siglip
+                img = img * 2.0 - 1.0
+
+                siglip_img_emb = self.model.paligemma_with_expert.get_siglip_image_features(img)
+                embs.append(siglip_img_emb.mean(dim=1, keepdim=True)) # B, 1 ,1152
+            embs = torch.cat(embs, dim=1) # B, num_goals, 1152
+
+            all_embs.append(embs)
+        return all_embs[0], all_embs[1]
+
+
     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training.
 
@@ -1247,10 +1381,12 @@ class PI05Policy(PreTrainedPolicy):
         images, img_masks = self._preprocess_images(batch)
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
+        list_multi_goal_static_feat, list_multi_goal_wrist_feat = self.embedding_multi_goal_images(batch)
+
         actions = self.prepare_action(batch)
 
         # Compute loss (no separate state needed for PI05)
-        losses = self.model.forward(images, img_masks, tokens, masks, actions)
+        losses, img_imi_loss, wrist_imi_loss, img_imi_dict, wrist_imi_dict = self.model.forward(images, img_masks, tokens, masks, actions, list_multi_goal_static_feat, list_multi_goal_wrist_feat)
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -1258,15 +1394,135 @@ class PI05Policy(PreTrainedPolicy):
 
         loss_dict = {
             "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
+            "img_imi_loss": img_imi_loss,
+            "wrist_imi_loss": wrist_imi_loss
         }
 
-        if reduction == "none":
-            # Return per-sample losses (B,) by averaging over time and action dims
-            per_sample_loss = losses.mean(dim=(1, 2))
-            loss_dict["loss"] = per_sample_loss.mean().item()
-            return per_sample_loss, loss_dict
-        else:
+        # if reduction == "none":
+        #     # Return per-sample losses (B,) by averaging over time and action dims
+        #     per_sample_loss = losses.mean(dim=(1, 2))
+        #     loss_dict["loss"] = per_sample_loss.mean().item()
+        #     return per_sample_loss, loss_dict
+        # else:
             # Default: return scalar mean loss
-            loss = losses.mean()
-            loss_dict["loss"] = loss.item()
-            return loss, loss_dict
+        loss = losses.mean() + img_imi_loss + wrist_imi_loss
+        loss_dict["loss"] = loss.item()
+        return loss, loss_dict
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def crop_image_by_mask(image: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """
+    Crop an image based on the bounding box of a binary/object mask,
+    then resize back to the original size.
+
+    Args:
+        image (torch.Tensor): [C, H, W] image tensor
+        mask (torch.Tensor): [C, H, W] object mask tensor
+
+    Returns:
+        torch.Tensor: cropped & resized image, same shape and dtype as input
+    """
+    assert image.ndim == 3 and mask.ndim == 3, "Expect both image and mask to have shape [C, H, W]"
+    C, H, W = image.shape
+
+    mask = (mask > 0.5)
+    # combine mask channels into a single binary mask
+    fg = (mask > 0).any(dim=0)
+
+    # find object bounding box
+    ys, xs = torch.where(fg)
+    if len(xs) == 0 or len(ys) == 0:
+        # no foreground — return original image unchanged
+        return image
+
+    y1, y2 = int(ys.min()), int(ys.max())
+    x1, x2 = int(xs.min()), int(xs.max())
+
+    # crop and resize back to original size
+    cropped = image[:, y1:y2+1, x1:x2+1].unsqueeze(0)  # [1, C, h, w]
+    resized = F.interpolate(cropped, size=(H, W), mode='bilinear', align_corners=False).squeeze(0)
+
+    return resized.to(image.dtype)
+
+class ClipInfoNCE(nn.Module):
+    """
+    CLIP-style symmetric InfoNCE loss.
+
+    Args:
+        init_temperature: initial temperature τ (paper commonly uses ~0.07).
+                          We store and learn logit_scale = log(1/τ) for stability.
+        max_logit_scale:  clamp logit_scale ≤ log(max_scale) (CLIP caps at log(100))
+    """
+    def __init__(self, init_temperature: float = 0.07, max_logit_scale: float = 100.0):
+        super().__init__()
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(1.0 / init_temperature)))
+        self.max_logit_scale = math.log(max_logit_scale)
+
+    def forward(self, current_embeds: torch.Tensor, goal_embeds: torch.Tensor):
+        """
+        current_embeds: [B, D]
+        goal_embeds : [B, D]
+        Returns:
+            loss: scalar
+            extras: dict with metrics
+        """
+        assert current_embeds.shape == goal_embeds.shape, f"{current_embeds.shape}, {goal_embeds.shape}"
+        B, D = current_embeds.shape
+
+        # 1) Normalize to get cosine similarities (as in CLIP)
+        current = F.normalize(current_embeds, dim=-1)
+        goal = F.normalize(goal_embeds, dim=-1)
+
+        # 2) Compute scaled logits (temperature via learned logit_scale)
+        #    logits_per_current = img @ txt^T * exp(logit_scale)
+        #    logits_per_goal  = txt @ img^T * exp(logit_scale)
+        with torch.no_grad():
+            # clamp only for forward; keep gradient flowing from unclamped param
+            logit_scale_clamped = self.logit_scale.clamp(max=self.max_logit_scale)
+        scale = logit_scale_clamped.exp()
+
+        sim = current @ goal.t()
+
+        logits_per_current = scale * sim        # [B, B]
+        logits_per_goal  = scale * sim.t()  
+
+        # 3) Labels: positives are on the diagonal
+        labels = torch.arange(B, device=current_embeds.device)
+
+        # 4) Symmetric cross-entropy
+        loss_i2t = F.cross_entropy(logits_per_current, labels)
+        loss_t2i = F.cross_entropy(logits_per_goal, labels)
+        base_loss  = 0.5 * (loss_i2t + loss_t2i)
+
+        pos_sim = sim.diag()       
+        neg_mask = ~torch.eye(B, dtype=torch.bool, device=current_embeds.device)
+        neg_sim = sim[neg_mask]
+
+        return base_loss, {
+            "temperature": scale.detach(),
+            "pos_mean": pos_sim.mean().detach(),
+            "neg_mean": neg_sim.mean().detach(),
+        }
