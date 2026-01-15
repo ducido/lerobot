@@ -1073,6 +1073,29 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # print(item['observation.images.object_of_interest_mask'].shape)
         item['observation.goal_mask_static_list'] = item['observation.images.object_of_interest_mask'][1:]
         item['observation.goal_mask_wrist_list'] = item['observation.images.object_of_interest_wrist_mask'][1:]
+
+
+        #################### Tracker
+        def crop_by_mask(image: torch.Tensor, mask: torch.Tensor):
+            # Use only one channel of the mask
+            m = mask[0]  # [H, W]
+            # Find non-zero mask positions
+            ys, xs = torch.where(m > 0.5)
+            if len(xs) == 0:
+                raise ValueError("Mask is empty!")
+            # Compute bounding box
+            ymin, ymax = ys.min(), ys.max()
+            xmin, xmax = xs.min(), xs.max()
+            # Crop image & mask
+            out = torch.zeros_like(image)
+            # copy only inside bounding box
+            out[:, ymin:ymax+1, xmin:xmax+1] = image[:, ymin:ymax+1, xmin:xmax+1]
+            return out
+
+        item['observation.image_future_object'] = crop_by_mask(item["observation.goal_static_list"][0], item['observation.goal_mask_static_list'][0])
+        item['observation.wrist_future_object'] = crop_by_mask(item["observation.goal_wrist_list"][0], item['observation.goal_mask_wrist_list'][0])
+        #################### Tracker
+    
         return item
 
     def __repr__(self):

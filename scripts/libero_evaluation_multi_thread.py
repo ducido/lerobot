@@ -7,11 +7,11 @@
 # sys.path.insert(0, "/projects/extern/kisski/kisski-umg-fairpact-2/dir.project/VLA/duc3/VLA-Humanoid")
 
 import os
-os.environ["HF_HOME"] = "/pfss/mlde/workspaces/mlde_wsp_PI_Hauschild/VLA/hf_cache"
+os.environ["HF_HOME"] = "/pfss/mlde/workspaces/mlde_wsp_IAS_SAMMerge/VLA/hf_cache"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["PYTHONPATH"] = "/pfss/mlde/workspaces/mlde_wsp_PI_Hauschild/VLA/duc/VLA-Humanoid:" + os.environ.get("PYTHONPATH", "")
+os.environ["PYTHONPATH"] = "/pfss/mlde/workspaces/mlde_wsp_IAS_SAMMerge/VLA/duc/lerobot:" + os.environ.get("PYTHONPATH", "")
 import sys
-sys.path.insert(0, "/pfss/mlde/workspaces/mlde_wsp_PI_Hauschild/VLA/duc/VLA-Humanoid")
+sys.path.insert(0, "/pfss/mlde/workspaces/mlde_wsp_IAS_SAMMerge/VLA/duc/lerobot")
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -39,7 +39,7 @@ LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
 
 '''
 python scripts/libero_evaluation_multi_thread.py \
---exp_name=libero_10%_baseline_synthetic+psuedo_action_posttrain_60k \
+--exp_name=pi05_libero_100%_baseline_20k \
 --task_suite_name=libero_10
 '''
 @dataclasses.dataclass
@@ -47,7 +47,7 @@ class Args:
     #################################################################################################################
     # Model server parameters%
     #################################################################################################################
-    pretrained_model_path: str = "outputs/train/2026-01-13/04-51-32_libero_10%_baseline_synthetic+psuedo_action_posttrain/checkpoints/060000/pretrained_model"
+    pretrained_model_path: str = "outputs/train/2026-01-13/11-52-49_pi05_libero_100%_baseline/checkpoints/020000/pretrained_model"
     resize_size: int = 224
     replan_steps: int = 10
 
@@ -69,10 +69,10 @@ class Args:
     # -------------------------------------------------------------------------------
     # Multi-GPU parallelization parameters
     # -------------------------------------------------------------------------------
-    gpus: str = "0,1,2,3"  # comma-separated list of GPU IDs to use
+    gpus: str = "0"  # comma-separated list of GPU IDs to use
 
 
-def eval_libero(args: Args) -> None:
+def eval_libero(args) -> None:
     # Set random seed
     np.random.seed(args.seed)
 

@@ -115,7 +115,7 @@ def update_policy(
             loss, output_dict = policy.forward(batch)
 
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
-
+        
     # Use accelerator's backward method
     accelerator.backward(loss)
 
@@ -368,6 +368,10 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         **processor_kwargs,
         **postprocessor_kwargs,
     )
+
+    print(preprocessor.state_dict())
+    print(postprocessor.state_dict())
+    breakpoint()
 
     if is_main_process:
         logging.info("Creating optimizer and scheduler")

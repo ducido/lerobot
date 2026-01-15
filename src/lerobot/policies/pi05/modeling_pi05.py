@@ -51,6 +51,8 @@ from lerobot.utils.constants import (
     OPENPI_ATTENTION_MASK_VALUE,
 )
 
+from lerobot.policies.pi05.tracker import *
+
 
 class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
@@ -384,6 +386,15 @@ class PaliGemmaWithExpertModel(
         self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
 
+        ###################### Tracker
+        num_obs_per_image = 4
+        self.num_obs_token = num_obs_per_image*2
+        track_hidden_dim = self.paligemma.language_model.layers[17].self_attn.q_proj.out_features
+
+        self.obs_tokens = nn.Parameter(torch.zeros(1, 1, self.num_obs_token, track_hidden_dim)) # (1, 1, 18, 2048)
+        self.tracker_model = Tracker_Model(hidden_dim=track_hidden_dim, num_obs_per_image=num_obs_per_image)
+        ###################### Tracker
+
         self.to_bfloat16_for_selected_params(precision)
         self._set_requires_grad()
 
@@ -455,6 +466,7 @@ class PaliGemmaWithExpertModel(
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
     ):
+        decoder_output, outputs_embeds_after_resi = None, None
         if adarms_cond is None:
             adarms_cond = [None, None]
         if inputs_embeds[1] is None:
@@ -518,7 +530,6 @@ class PaliGemmaWithExpertModel(
                         gemma_expert=self.gemma_expert,
                     )
 
-            outputs_embeds_after_resi = inputs_embeds
 
             # final norm
             def compute_final_norms(inputs_embeds, adarms_cond):
@@ -544,7 +555,14 @@ class PaliGemmaWithExpertModel(
             suffix_output = outputs_embeds[1]
             prefix_past_key_values = None
 
-        return [prefix_output, suffix_output], prefix_past_key_values, outputs_embeds_after_resi
+            ############# Implicit
+            outputs_embeds_after_resi = inputs_embeds
+
+            ############# Explicit
+            track_output = outputs_embeds[0][:, -self.num_obs_token:, :]
+            decoder_output = self.tracker_model(track_output)
+
+        return [prefix_output, suffix_output], prefix_past_key_values, decoder_output, outputs_embeds_after_resi
 
 
 class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
@@ -583,7 +601,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         self.num_goals = 1
         self.mapping_pali_to_siglip_list = nn.ModuleList(
             [nn.Linear(2048, 1152) for _ in range(self.num_goals)]
-        )
+        ).to(torch.bfloat16)
         # self.mapping_siglip_to_pali_list = nn.ModuleList(
         #     [nn.Linear(1152, 2048) for _ in range(self.num_goals)]
         # ).to(torch.bfloat16)
@@ -685,6 +703,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             lang_emb_dim = lang_emb.shape[-1]
             return lang_emb * math.sqrt(lang_emb_dim)
 
+        
+
         lang_emb = self._apply_checkpoint(lang_embed_func, tokens)
         embs.append(lang_emb)
         pad_masks.append(masks)
@@ -756,7 +776,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, images, img_masks, tokens, masks, actions, list_multi_goal_static_feat, list_multi_goal_wrist_feat, noise=None, time=None) -> Tensor:
+    def forward(self, images, img_masks, tokens, masks, actions, list_multi_goal_static_feat, list_multi_goal_wrist_feat, images_future, noise=None, time=None) -> Tensor:
         """Do a full training forward pass and compute the loss."""
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -775,8 +795,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
         ):
-            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
-            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+            suffix_embs = suffix_embs.to(dtype=torch.bfloat16)     # 50 tokens
+            prefix_embs = prefix_embs.to(dtype=torch.bfloat16)     # 714 tokens
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
@@ -784,10 +804,18 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
+
+        ####################### Modify Attention Mask Tracker
+        track_pad = torch.ones((prefix_pad_masks.shape[0], 8), dtype=torch.bool, device=prefix_pad_masks.device)
+        position_ids = torch.cumsum(torch.cat([prefix_pad_masks, track_pad, suffix_pad_masks], dim=1), dim=1) -1
+        att_2d_masks = insert_track_attention_mask(att_2d_masks, 8, prefix_pad_masks.shape[1], prefix_pad_masks)
+        prefix_embs = torch.cat((prefix_embs, self.paligemma_with_expert.obs_tokens.repeat(att_2d_masks.shape[0], 1, 1, 1).flatten(1, 2)), dim = 1)
+        #######################
+
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out), _, outputs_embeds_after_resi  = self.paligemma_with_expert.forward(
+            (_, suffix_out), _, track_decoder_out, outputs_embeds_after_resi  = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
                 past_key_values=None,
@@ -795,9 +823,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
             )
-            return suffix_out, outputs_embeds_after_resi 
+            return suffix_out, outputs_embeds_after_resi, track_decoder_out
 
-        suffix_out, outputs_embeds_after_resi  = self._apply_checkpoint(
+        suffix_out, outputs_embeds_after_resi, track_decoder_out  = self._apply_checkpoint(
             forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
 
@@ -809,14 +837,28 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
         action_loss = F.mse_loss(u_t, v_t, reduction="none")
 
+        #################### Implicit
         img_imi_loss, wrist_imi_loss, img_imi_dict, wrist_imi_dict = self.imi_loss(outputs_embeds_after_resi, list_multi_goal_static_feat, list_multi_goal_wrist_feat)
+        #################### Explicit
+        patchify_model = self.paligemma_with_expert.paligemma.vision_tower.vision_model.embeddings.patch_embedding
+        label_image_future = patchify(images_future[0], patch_size=14, vision_model=patchify_model).unsqueeze(1)
+        label_wrist_future = patchify(images_future[1], patch_size=14, vision_model=patchify_model).unsqueeze(1)
 
-        return action_loss, img_imi_loss, wrist_imi_loss, img_imi_dict, wrist_imi_dict
+        label_image_future = label_image_future.unfold(1, 1, 1).permute(0, 1, 4, 2, 3).flatten(0, 1)
+        label_wrist_future = label_wrist_future.unfold(1, 1, 1).permute(0, 1, 4, 2, 3).flatten(0, 1)
+        
+        loss_track = 0.5 * (torch.nn.functional.mse_loss(
+                track_decoder_out[:, 0, :, :, :], 
+                (label_image_future).detach().to(dtype=track_decoder_out.dtype)) + 
+                torch.nn.functional.mse_loss(
+                track_decoder_out[:, 1, :, :, :], 
+                (label_wrist_future).detach()).to(dtype=track_decoder_out.dtype))
+
+        return action_loss, loss_track, img_imi_loss, wrist_imi_loss, img_imi_dict, wrist_imi_dict
 
     def imi_loss(self, outputs_embeds_after_resi, list_multi_goal_static_feat, list_multi_goal_wrist_feat):
         prefix_emb_after_resi, _ = outputs_embeds_after_resi
         current_rep_tokens_after_resi = prefix_emb_after_resi[:,(-2*self.num_goals):,:] # dim = 2048
-        current_rep_tokens_after_resi = F.normalize(current_rep_tokens_after_resi, dim=-1).to(dtype=torch.float32)
 
 
         current_rep_static_emb_after_resi = current_rep_tokens_after_resi[:,0::2]
@@ -840,8 +882,8 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         for i in range(self.num_goals):
             current_rep_token_static_embs = self.mapping_pali_to_siglip_list[i](current_rep_static_emb_after_resi[:,i])
             current_rep_token_wrist_embs = self.mapping_pali_to_siglip_list[i](current_rep_wrist_emb_after_resi[:,i])
-            a, a_dict = self.infonce_loss(current_rep_token_static_embs, list_multi_goal_static_feat[:,i,:].detach().to(dtype=torch.float32))
-            b, b_dict = self.infonce_loss(current_rep_token_wrist_embs, list_multi_goal_wrist_feat[:,i,:].detach().to(dtype=torch.float32))
+            a, a_dict = self.infonce_loss(current_rep_token_static_embs, list_multi_goal_static_feat[:,i,:].detach())
+            b, b_dict = self.infonce_loss(current_rep_token_wrist_embs, list_multi_goal_wrist_feat[:,i,:].detach())
 
             img_imi_loss += a / self.num_goals
             wrist_imi_loss += b / self.num_goals
@@ -1368,6 +1410,60 @@ class PI05Policy(PreTrainedPolicy):
         return all_embs[0], all_embs[1]
 
 
+    def prepare_images_future(self, batch: dict[str, Tensor]) -> tuple[list[Tensor], list[Tensor]]:
+        """Preprocess images for the model.
+
+        Images from LeRobot are typically in [B, C, H, W] format and normalized to [0, 1].
+        PaliGemma expects images in [B, C, H, W] format and normalized to [-1, 1].
+        """
+        images = []
+        img_masks = []
+
+        # Get device from model parameters
+        device = next(self.parameters()).device
+
+        # present_img_keys = [key for key in self.config.image_features if key in batch]
+        present_img_keys = ['observation.image_future_object', 'observation.wrist_future_object']
+
+        # Preprocess image features present in the batch
+        for key in present_img_keys:
+            img = batch[key]
+
+            # Ensure tensor is on the same device as the model
+            if img.device != device:
+                img = img.to(device)
+
+            # Ensure float32 dtype for consistency
+            if img.dtype != torch.float32:
+                img = img.to(torch.float32)
+
+            # from openpi preprocess_observation_pytorch: Handle both [B, C, H, W] and [B, H, W, C] formats
+            is_channels_first = img.shape[1] == 3  # Check if channels are in dimension 1
+
+            if is_channels_first:
+                # Convert [B, C, H, W] to [B, H, W, C] for processing
+                img = img.permute(0, 2, 3, 1)
+
+            # from openpi preprocess_observation_pytorch: Resize with padding if needed
+            if img.shape[1:3] != self.config.image_resolution:
+                img = resize_with_pad_torch(img, *self.config.image_resolution)
+
+            # Normalize from [0,1] to [-1,1] as expected by siglip
+            img = img * 2.0 - 1.0
+
+            # from openpi preprocess_observation_pytorch: Convert back to [B, C, H, W] format if it was originally channels-first
+            if is_channels_first:
+                img = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+
+            images.append(img)
+            # Create mask (all ones for real images)
+            bsize = img.shape[0]
+            mask = torch.ones(bsize, dtype=torch.bool, device=device)
+            img_masks.append(mask)
+
+        return images, img_masks
+
+
     def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training.
 
@@ -1382,11 +1478,12 @@ class PI05Policy(PreTrainedPolicy):
         tokens, masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
         list_multi_goal_static_feat, list_multi_goal_wrist_feat = self.embedding_multi_goal_images(batch)
+        images_future, _ = self.prepare_images_future(batch)
 
         actions = self.prepare_action(batch)
 
         # Compute loss (no separate state needed for PI05)
-        losses, img_imi_loss, wrist_imi_loss, img_imi_dict, wrist_imi_dict = self.model.forward(images, img_masks, tokens, masks, actions, list_multi_goal_static_feat, list_multi_goal_wrist_feat)
+        losses, loss_track, img_imi_loss, wrist_imi_loss, img_imi_dict, wrist_imi_dict = self.model.forward(images, img_masks, tokens, masks, actions, list_multi_goal_static_feat, list_multi_goal_wrist_feat, images_future)
 
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
@@ -1394,8 +1491,9 @@ class PI05Policy(PreTrainedPolicy):
 
         loss_dict = {
             "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),
-            "img_imi_loss": img_imi_loss,
-            "wrist_imi_loss": wrist_imi_loss
+            "img_imi_loss": img_imi_loss.detach().item(),
+            "wrist_imi_loss": wrist_imi_loss.detach().item(),
+            "loss_track": loss_track.detach().item()
         }
 
         # if reduction == "none":
@@ -1405,7 +1503,8 @@ class PI05Policy(PreTrainedPolicy):
         #     return per_sample_loss, loss_dict
         # else:
             # Default: return scalar mean loss
-        loss = losses.mean() + img_imi_loss + wrist_imi_loss
+        loss = losses.mean() + img_imi_loss + wrist_imi_loss  # + loss_track
+        
         loss_dict["loss"] = loss.item()
         return loss, loss_dict
 
